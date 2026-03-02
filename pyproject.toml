@@ -1,0 +1,18 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 79
+indent-width = 4
+extend-exclude = [
+  "data",
+  "cache",
+  "build",
+  "dist",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
