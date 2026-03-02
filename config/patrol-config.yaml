@@ -4,7 +4,9 @@ tb4_patrol:
     undock_settle_sec: 1.0
     forward_distance_m: 0.25
     forward_speed_mps: 0.10
-    circle_diameter_m: 1.5
+    rotate_before_circle_deg: 90.0
+    rotate_speed_radps: 0.6
+    circle_diameter_m: 1.0
     circle_linear_speed_mps: 0.12
     max_action_retries: 3
     control_rate_hz: 10.0

@@ -20,7 +20,9 @@ from typing_extensions import Self
 class DemoPhase(Enum):
     UNDOCK = auto()
     DRIVE_FORWARD = auto()
+    ROTATE_FOR_CIRCLE = auto()
     CIRCLE = auto()
+    ROTATE_TO_DOCK = auto()
     DRIVE_BACK = auto()
     DOCK = auto()
     WAIT_NEXT_CYCLE = auto()
@@ -42,7 +44,9 @@ class Tb4Patrol(Node):
                 ("undock_settle_sec", 1.0),
                 ("forward_distance_m", 0.25),
                 ("forward_speed_mps", 0.10),
-                ("circle_diameter_m", 1.5),
+                ("rotate_before_circle_deg", 90.0),
+                ("rotate_speed_radps", 0.6),
+                ("circle_diameter_m", 1.0),
                 ("circle_linear_speed_mps", 0.12),
                 ("max_action_retries", 3),
                 ("control_rate_hz", 10.0),
@@ -55,6 +59,12 @@ class Tb4Patrol(Node):
         self.undock_settle_sec = float(self.get_parameter("undock_settle_sec").value)
         self.forward_distance_m = float(self.get_parameter("forward_distance_m").value)
         self.forward_speed_mps = float(self.get_parameter("forward_speed_mps").value)
+        self.rotate_before_circle_deg = float(
+            self.get_parameter("rotate_before_circle_deg").value
+        )
+        self.rotate_speed_radps = float(
+            self.get_parameter("rotate_speed_radps").value
+        )
         self.circle_diameter_m = float(self.get_parameter("circle_diameter_m").value)
         self.circle_linear_speed_mps = float(
             self.get_parameter("circle_linear_speed_mps").value
@@ -72,15 +82,43 @@ class Tb4Patrol(Node):
             raise ValueError("forward_speed_mps must be > 0.0")
         if self.circle_linear_speed_mps <= 0.0:
             raise ValueError("circle_linear_speed_mps must be > 0.0")
+        if self.rotate_speed_radps <= 0.0:
+            raise ValueError("rotate_speed_radps must be > 0.0")
         if self.control_rate_hz <= 0.0:
             raise ValueError("control_rate_hz must be > 0.0")
 
         self.forward_duration_sec = self.forward_distance_m / self.forward_speed_mps
+        self.rotate_before_circle_rad = math.radians(self.rotate_before_circle_deg)
+        self.rotate_duration_sec = (
+            abs(self.rotate_before_circle_rad) / self.rotate_speed_radps
+        )
+        self.rotate_direction = (
+            1.0 if self.rotate_before_circle_rad >= 0.0 else -1.0
+        )
+        # After a full circle heading remains (initial + rotate_before_circle_rad).
+        # Rotate to face dock direction (initial + pi).
+        rotate_to_dock_rad = self.normalize_angle(
+            math.pi - self.rotate_before_circle_rad
+        )
+        self.rotate_to_dock_duration_sec = (
+            abs(rotate_to_dock_rad) / self.rotate_speed_radps
+        )
+        self.rotate_to_dock_direction = (
+            1.0 if rotate_to_dock_rad >= 0.0 else -1.0
+        )
+        self.rotate_to_dock_deg = math.degrees(rotate_to_dock_rad)
         self.circle_radius_m = max(self.circle_diameter_m / 2.0, 0.05)
-        self.circle_angular_speed_rps = (
+        self.circle_angular_speed_abs_rps = (
             self.circle_linear_speed_mps / self.circle_radius_m
         )
-        self.circle_duration_sec = (2.0 * math.pi) / abs(self.circle_angular_speed_rps)
+        # Keep the circle away from dock:
+        # after pre-rotation, turn in the opposite direction.
+        self.circle_angular_speed_rps = (
+            -self.rotate_direction * self.circle_angular_speed_abs_rps
+        )
+        self.circle_duration_sec = (
+            2.0 * math.pi
+        ) / self.circle_angular_speed_abs_rps
 
         self.publisher_cmd_vel = self.create_publisher(
             Twist,
@@ -146,11 +184,16 @@ class Tb4Patrol(Node):
         self.get_logger().info(
             (
                 "tb4_patrol started: forward=%.2fm @ %.2fm/s, "
+                "rotate=%.1fdeg @ %.2frad/s, "
+                "return_rotate=%.1fdeg, "
                 "circle_diam=%.2fm @ %.2fm/s, cycle_period=%.0fs"
             )
             % (
                 self.forward_distance_m,
                 self.forward_speed_mps,
+                self.rotate_before_circle_deg,
+                self.rotate_speed_radps,
+                self.rotate_to_dock_deg,
                 self.circle_diameter_m,
                 self.circle_linear_speed_mps,
                 self.cycle_period_sec,
@@ -181,8 +224,19 @@ class Tb4Patrol(Node):
             if self.elapsed_phase_sec() >= self.forward_duration_sec:
                 self.stop_robot()
                 self.transition_to(
+                    DemoPhase.ROTATE_FOR_CIRCLE,
+                    "Forward step done, rotating before circle",
+                )
+            return
+
+        if self.phase == DemoPhase.ROTATE_FOR_CIRCLE:
+            self.publish_rotation()
+            self.log_telemetry(now)
+            if self.elapsed_phase_sec() >= self.rotate_duration_sec:
+                self.stop_robot()
+                self.transition_to(
                     DemoPhase.CIRCLE,
-                    "Forward step done, starting circle motion",
+                    "Rotation done, starting circle motion",
                 )
             return
 
@@ -192,13 +246,24 @@ class Tb4Patrol(Node):
             if self.elapsed_phase_sec() >= self.circle_duration_sec:
                 self.stop_robot()
                 self.transition_to(
+                    DemoPhase.ROTATE_TO_DOCK,
+                    "Circle done, rotating back toward dock",
+                )
+            return
+
+        if self.phase == DemoPhase.ROTATE_TO_DOCK:
+            self.publish_rotation_to_dock()
+            self.log_telemetry(now)
+            if self.elapsed_phase_sec() >= self.rotate_to_dock_duration_sec:
+                self.stop_robot()
+                self.transition_to(
                     DemoPhase.DRIVE_BACK,
-                    "Circle done, returning closer to dock",
+                    "Facing dock, driving forward back to station",
                 )
             return
 
         if self.phase == DemoPhase.DRIVE_BACK:
-            self.publish_backward()
+            self.publish_forward()
             self.log_telemetry(now)
             if self.elapsed_phase_sec() >= self.forward_duration_sec:
                 self.stop_robot()
@@ -293,16 +358,24 @@ class Tb4Patrol(Node):
         msg.linear.x = self.forward_speed_mps
         self.publisher_cmd_vel.publish(msg)
 
-    def publish_backward(self) -> None:
-        msg = Twist()
-        msg.linear.x = -self.forward_speed_mps
-        self.publisher_cmd_vel.publish(msg)
-
     def publish_circle(self) -> None:
         msg = Twist()
         msg.linear.x = self.circle_linear_speed_mps
         msg.angular.z = self.circle_angular_speed_rps
         self.publisher_cmd_vel.publish(msg)
+
+    def publish_rotation(self) -> None:
+        msg = Twist()
+        msg.angular.z = self.rotate_direction * self.rotate_speed_radps
+        self.publisher_cmd_vel.publish(msg)
+
+    def publish_rotation_to_dock(self) -> None:
+        msg = Twist()
+        msg.angular.z = self.rotate_to_dock_direction * self.rotate_speed_radps
+        self.publisher_cmd_vel.publish(msg)
+
+    def normalize_angle(self, angle_rad: float) -> float:
+        return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
 
     def stop_robot(self) -> None:
         self.publisher_cmd_vel.publish(Twist())
