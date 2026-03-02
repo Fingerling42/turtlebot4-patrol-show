@@ -1,9 +1,12 @@
 tb4_patrol:
   ros__parameters:
-    patrol_duration_sec: 45.0
-    linear_speed: 0.16
-    turn_speed: 0.8
-    obstacle_distance_m: 0.55
-    front_sector_deg: 40.0
-    side_sector_deg: 40.0
+    cycle_period_sec: 180.0
+    undock_settle_sec: 1.0
+    forward_distance_m: 0.25
+    forward_speed_mps: 0.10
+    circle_diameter_m: 1.5
+    circle_linear_speed_mps: 0.12
     max_action_retries: 3
+    control_rate_hz: 10.0
+    telemetry_log_period_sec: 2.0
+    obstacle_log_warn_distance_m: 0.40

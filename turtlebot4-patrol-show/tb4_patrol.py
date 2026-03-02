@@ -6,25 +6,29 @@ import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Twist
 from irobot_create_msgs.action import Dock, Undock
+from nav_msgs.msg import Odometry
 from rclpy import Future
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from typing_extensions import Self
 
 
-class ShowPhase(Enum):
+class DemoPhase(Enum):
     UNDOCK = auto()
-    PATROL = auto()
+    DRIVE_FORWARD = auto()
+    CIRCLE = auto()
+    DRIVE_BACK = auto()
     DOCK = auto()
-    FINISHED = auto()
+    WAIT_NEXT_CYCLE = auto()
     FAILED = auto()
 
 
 class Tb4Patrol(Node):
-    """Simple TurtleBot4 Pro show cycle: Undock -> Patrol -> Dock."""
+    """Simple scripted TurtleBot4 Pro demo with periodic cycles."""
 
     def __init__(self) -> None:
         super().__init__("tb4_patrol")
@@ -34,33 +38,49 @@ class Tb4Patrol(Node):
         self.declare_parameters(
             namespace="",
             parameters=[
-                ("patrol_duration_sec", 45.0),
-                ("linear_speed", 0.16),
-                ("turn_speed", 0.8),
-                ("obstacle_distance_m", 0.55),
-                ("front_sector_deg", 40.0),
-                ("side_sector_deg", 40.0),
+                ("cycle_period_sec", 180.0),
+                ("undock_settle_sec", 1.0),
+                ("forward_distance_m", 0.25),
+                ("forward_speed_mps", 0.10),
+                ("circle_diameter_m", 1.5),
+                ("circle_linear_speed_mps", 0.12),
                 ("max_action_retries", 3),
+                ("control_rate_hz", 10.0),
+                ("telemetry_log_period_sec", 2.0),
+                ("obstacle_log_warn_distance_m", 0.40),
             ],
         )
 
-        self.patrol_duration_sec = float(
-            self.get_parameter("patrol_duration_sec").value
+        self.cycle_period_sec = float(self.get_parameter("cycle_period_sec").value)
+        self.undock_settle_sec = float(self.get_parameter("undock_settle_sec").value)
+        self.forward_distance_m = float(self.get_parameter("forward_distance_m").value)
+        self.forward_speed_mps = float(self.get_parameter("forward_speed_mps").value)
+        self.circle_diameter_m = float(self.get_parameter("circle_diameter_m").value)
+        self.circle_linear_speed_mps = float(
+            self.get_parameter("circle_linear_speed_mps").value
         )
-        self.linear_speed = float(self.get_parameter("linear_speed").value)
-        self.turn_speed = float(self.get_parameter("turn_speed").value)
-        self.obstacle_distance_m = float(
-            self.get_parameter("obstacle_distance_m").value
+        self.max_action_retries = int(self.get_parameter("max_action_retries").value)
+        self.control_rate_hz = float(self.get_parameter("control_rate_hz").value)
+        self.telemetry_log_period_sec = float(
+            self.get_parameter("telemetry_log_period_sec").value
         )
-        self.front_sector_deg = float(
-            self.get_parameter("front_sector_deg").value
+        self.obstacle_log_warn_distance_m = float(
+            self.get_parameter("obstacle_log_warn_distance_m").value
         )
-        self.side_sector_deg = float(
-            self.get_parameter("side_sector_deg").value
+
+        if self.forward_speed_mps <= 0.0:
+            raise ValueError("forward_speed_mps must be > 0.0")
+        if self.circle_linear_speed_mps <= 0.0:
+            raise ValueError("circle_linear_speed_mps must be > 0.0")
+        if self.control_rate_hz <= 0.0:
+            raise ValueError("control_rate_hz must be > 0.0")
+
+        self.forward_duration_sec = self.forward_distance_m / self.forward_speed_mps
+        self.circle_radius_m = max(self.circle_diameter_m / 2.0, 0.05)
+        self.circle_angular_speed_rps = (
+            self.circle_linear_speed_mps / self.circle_radius_m
         )
-        self.max_action_retries = int(
-            self.get_parameter("max_action_retries").value
-        )
+        self.circle_duration_sec = (2.0 * math.pi) / abs(self.circle_angular_speed_rps)
 
         self.publisher_cmd_vel = self.create_publisher(
             Twist,
@@ -73,6 +93,14 @@ class Tb4Patrol(Node):
             LaserScan,
             "/scan",
             self.scan_callback,
+            qos_profile_sensor_data,
+            callback_group=self.work_callback_group,
+        )
+
+        self.subscriber_odom = self.create_subscription(
+            Odometry,
+            "/odom",
+            self.odom_callback,
             10,
             callback_group=self.work_callback_group,
         )
@@ -91,51 +119,112 @@ class Tb4Patrol(Node):
             callback_group=self.work_callback_group,
         )
 
-        self.phase = ShowPhase.UNDOCK
-        self.latest_scan: Optional[LaserScan] = None
-        self.patrol_start_time: Optional[float] = None
+        self.phase = DemoPhase.UNDOCK
+        self.phase_start_sec = self.now_sec()
+        self.next_cycle_time_sec: Optional[float] = None
 
         self.action_status_undock: Optional[int] = None
         self.action_status_dock: Optional[int] = None
-
         self.undock_goal_sent = False
         self.dock_goal_sent = False
-
         self.undock_retries = 0
         self.dock_retries = 0
 
-        self.timer_state = self.create_timer(
-            0.1,
-            self.state_machine_step,
+        self.odom_linear_speed_mps: Optional[float] = None
+        self.odom_yaw_rate_rps: Optional[float] = None
+        self.scan_nearest_m: Optional[float] = None
+        self.scan_nearest_deg: Optional[float] = None
+        self.last_telemetry_log_sec = 0.0
+
+        control_period_sec = 1.0 / self.control_rate_hz
+        self.timer_control = self.create_timer(
+            control_period_sec,
+            self.control_step,
             callback_group=self.work_callback_group,
         )
 
-        self.timer_patrol = self.create_timer(
-            0.1,
-            self.patrol_control_step,
-            callback_group=self.work_callback_group,
+        self.get_logger().info(
+            (
+                "tb4_patrol started: forward=%.2fm @ %.2fm/s, "
+                "circle_diam=%.2fm @ %.2fm/s, cycle_period=%.0fs"
+            )
+            % (
+                self.forward_distance_m,
+                self.forward_speed_mps,
+                self.circle_diameter_m,
+                self.circle_linear_speed_mps,
+                self.cycle_period_sec,
+            )
         )
-        self.timer_patrol.cancel()
 
-        self.get_logger().info("tb4_patrol node started")
+    def now_sec(self) -> float:
+        return self.get_clock().now().nanoseconds / 1e9
 
-    def state_machine_step(self) -> None:
-        if self.phase == ShowPhase.UNDOCK:
-            self._run_undock_phase()
+    def elapsed_phase_sec(self) -> float:
+        return self.now_sec() - self.phase_start_sec
+
+    def transition_to(self, new_phase: DemoPhase, message: str) -> None:
+        self.phase = new_phase
+        self.phase_start_sec = self.now_sec()
+        self.get_logger().info(message)
+
+    def control_step(self) -> None:
+        now = self.now_sec()
+
+        if self.phase == DemoPhase.UNDOCK:
+            self.run_undock_phase()
             return
 
-        if self.phase == ShowPhase.PATROL:
-            self._run_patrol_phase()
+        if self.phase == DemoPhase.DRIVE_FORWARD:
+            self.publish_forward()
+            self.log_telemetry(now)
+            if self.elapsed_phase_sec() >= self.forward_duration_sec:
+                self.stop_robot()
+                self.transition_to(
+                    DemoPhase.CIRCLE,
+                    "Forward step done, starting circle motion",
+                )
             return
 
-        if self.phase == ShowPhase.DOCK:
-            self._run_dock_phase()
+        if self.phase == DemoPhase.CIRCLE:
+            self.publish_circle()
+            self.log_telemetry(now)
+            if self.elapsed_phase_sec() >= self.circle_duration_sec:
+                self.stop_robot()
+                self.transition_to(
+                    DemoPhase.DRIVE_BACK,
+                    "Circle done, returning closer to dock",
+                )
             return
 
-        if self.phase in (ShowPhase.FINISHED, ShowPhase.FAILED):
+        if self.phase == DemoPhase.DRIVE_BACK:
+            self.publish_backward()
+            self.log_telemetry(now)
+            if self.elapsed_phase_sec() >= self.forward_duration_sec:
+                self.stop_robot()
+                self.transition_to(
+                    DemoPhase.DOCK,
+                    "Return step done, starting dock action",
+                )
+            return
+
+        if self.phase == DemoPhase.DOCK:
+            self.run_dock_phase()
+            return
+
+        if self.phase == DemoPhase.WAIT_NEXT_CYCLE:
+            self.stop_robot()
+            if self.next_cycle_time_sec is None:
+                self.next_cycle_time_sec = now + self.cycle_period_sec
+            if now >= self.next_cycle_time_sec:
+                self.reset_cycle_state()
+                self.transition_to(DemoPhase.UNDOCK, "Starting next demo cycle")
+            return
+
+        if self.phase == DemoPhase.FAILED:
             self.stop_robot()
 
-    def _run_undock_phase(self) -> None:
+    def run_undock_phase(self) -> None:
         if not self.undock_goal_sent:
             if not self.undock_action_client.wait_for_server(timeout_sec=0.0):
                 self.get_logger().info(
@@ -143,7 +232,6 @@ class Tb4Patrol(Node):
                     throttle_duration_sec=5.0,
                 )
                 return
-
             self.send_goal_undock()
             self.undock_goal_sent = True
             return
@@ -152,38 +240,23 @@ class Tb4Patrol(Node):
             return
 
         if self.action_status_undock == GoalStatus.STATUS_SUCCEEDED:
-            self.phase = ShowPhase.PATROL
-            self.patrol_start_time = self.get_clock().now().nanoseconds / 1e9
-            self.timer_patrol.reset()
-            self.get_logger().info("Undock done, switching to patrol")
+            if self.elapsed_phase_sec() >= self.undock_settle_sec:
+                self.transition_to(
+                    DemoPhase.DRIVE_FORWARD,
+                    "Undock done, moving forward from station",
+                )
             return
 
         self.undock_retries += 1
         if self.undock_retries > self.max_action_retries:
-            self.phase = ShowPhase.FAILED
-            self.get_logger().error("Undock failed after max retries")
+            self.transition_to(DemoPhase.FAILED, "Undock failed after max retries")
             return
 
         self.get_logger().warn("Undock failed, retrying...")
         self.action_status_undock = None
         self.undock_goal_sent = False
 
-    def _run_patrol_phase(self) -> None:
-        if self.patrol_start_time is None:
-            self.patrol_start_time = self.get_clock().now().nanoseconds / 1e9
-
-        now_sec = self.get_clock().now().nanoseconds / 1e9
-        elapsed = now_sec - self.patrol_start_time
-
-        if elapsed >= self.patrol_duration_sec:
-            self.timer_patrol.cancel()
-            self.stop_robot()
-            self.phase = ShowPhase.DOCK
-            self.get_logger().info(
-                "Patrol duration is over, switching to dock"
-            )
-
-    def _run_dock_phase(self) -> None:
+    def run_dock_phase(self) -> None:
         if not self.dock_goal_sent:
             if not self.dock_action_client.wait_for_server(timeout_sec=0.0):
                 self.get_logger().info(
@@ -191,7 +264,6 @@ class Tb4Patrol(Node):
                     throttle_duration_sec=5.0,
                 )
                 return
-
             self.send_goal_dock()
             self.dock_goal_sent = True
             return
@@ -200,91 +272,114 @@ class Tb4Patrol(Node):
             return
 
         if self.action_status_dock == GoalStatus.STATUS_SUCCEEDED:
-            self.phase = ShowPhase.FINISHED
-            self.get_logger().info("Dock done, show cycle finished")
+            self.next_cycle_time_sec = self.now_sec() + self.cycle_period_sec
+            self.transition_to(
+                DemoPhase.WAIT_NEXT_CYCLE,
+                "Dock done, waiting before next cycle",
+            )
             return
 
         self.dock_retries += 1
         if self.dock_retries > self.max_action_retries:
-            self.phase = ShowPhase.FAILED
-            self.get_logger().error("Dock failed after max retries")
+            self.transition_to(DemoPhase.FAILED, "Dock failed after max retries")
             return
 
         self.get_logger().warn("Dock failed, retrying...")
         self.action_status_dock = None
         self.dock_goal_sent = False
 
+    def publish_forward(self) -> None:
+        msg = Twist()
+        msg.linear.x = self.forward_speed_mps
+        self.publisher_cmd_vel.publish(msg)
+
+    def publish_backward(self) -> None:
+        msg = Twist()
+        msg.linear.x = -self.forward_speed_mps
+        self.publisher_cmd_vel.publish(msg)
+
+    def publish_circle(self) -> None:
+        msg = Twist()
+        msg.linear.x = self.circle_linear_speed_mps
+        msg.angular.z = self.circle_angular_speed_rps
+        self.publisher_cmd_vel.publish(msg)
+
+    def stop_robot(self) -> None:
+        self.publisher_cmd_vel.publish(Twist())
+
     def scan_callback(self, msg: LaserScan) -> None:
-        self.latest_scan = msg
+        nearest = math.inf
+        nearest_deg = 0.0
 
-    def patrol_control_step(self) -> None:
-        if self.phase != ShowPhase.PATROL:
-            return
+        for i, distance in enumerate(msg.ranges):
+            if math.isnan(distance) or math.isinf(distance):
+                continue
+            if distance < msg.range_min or distance > msg.range_max:
+                continue
 
-        if self.latest_scan is None:
-            self.get_logger().warn(
-                "No /scan messages yet", throttle_duration_sec=5.0
-            )
-            self.stop_robot()
-            return
+            if distance < nearest:
+                nearest = distance
+                angle = msg.angle_min + i * msg.angle_increment
+                nearest_deg = math.degrees(angle)
 
-        cmd_msg = Twist()
-
-        front_min = self._sector_min_distance(
-            self.latest_scan, center_deg=0.0, width_deg=self.front_sector_deg
-        )
-        left_min = self._sector_min_distance(
-            self.latest_scan, center_deg=90.0, width_deg=self.side_sector_deg
-        )
-        right_min = self._sector_min_distance(
-            self.latest_scan, center_deg=-90.0, width_deg=self.side_sector_deg
-        )
-
-        if front_min < self.obstacle_distance_m:
-            cmd_msg.linear.x = 0.0
-            cmd_msg.angular.z = (
-                self.turn_speed if left_min > right_min else -self.turn_speed
-            )
+        if math.isinf(nearest):
+            self.scan_nearest_m = None
+            self.scan_nearest_deg = None
         else:
-            cmd_msg.linear.x = self.linear_speed
-            cmd_msg.angular.z = 0.0
+            self.scan_nearest_m = nearest
+            self.scan_nearest_deg = nearest_deg
 
-        self.publisher_cmd_vel.publish(cmd_msg)
+    def odom_callback(self, msg: Odometry) -> None:
+        linear = msg.twist.twist.linear
+        angular = msg.twist.twist.angular
 
-    def _sector_min_distance(
-        self,
-        scan_msg: LaserScan,
-        center_deg: float,
-        width_deg: float,
-    ) -> float:
-        if not scan_msg.ranges:
-            return math.inf
+        self.odom_linear_speed_mps = math.sqrt(
+            linear.x * linear.x + linear.y * linear.y + linear.z * linear.z
+        )
+        self.odom_yaw_rate_rps = angular.z
 
-        if scan_msg.angle_increment == 0.0:
-            return math.inf
+    def log_telemetry(self, now_sec: float) -> None:
+        if now_sec - self.last_telemetry_log_sec < self.telemetry_log_period_sec:
+            return
 
-        half_width = math.radians(width_deg) / 2.0
-        center_rad = math.radians(center_deg)
-        start = center_rad - half_width
-        end = center_rad + half_width
+        speed_text = "n/a"
+        if self.odom_linear_speed_mps is not None:
+            speed_text = "%.3f m/s" % self.odom_linear_speed_mps
 
-        min_range = math.inf
+        yaw_text = "n/a"
+        if self.odom_yaw_rate_rps is not None:
+            yaw_text = "%.3f rad/s" % self.odom_yaw_rate_rps
 
-        for i, value in enumerate(scan_msg.ranges):
-            angle = scan_msg.angle_min + i * scan_msg.angle_increment
-            if angle < start or angle > end:
-                continue
+        obstacle_text = "n/a"
+        obstacle_distance = self.scan_nearest_m
+        if obstacle_distance is not None and self.scan_nearest_deg is not None:
+            obstacle_text = "%.3f m at %.1f deg" % (
+                obstacle_distance,
+                self.scan_nearest_deg,
+            )
 
-            if math.isinf(value) or math.isnan(value):
-                continue
+        log_msg = (
+            "phase=%s | odom_speed=%s | yaw_rate=%s | nearest_scan=%s"
+            % (self.phase.name, speed_text, yaw_text, obstacle_text)
+        )
 
-            if value < scan_msg.range_min or value > scan_msg.range_max:
-                continue
+        if (
+            obstacle_distance is not None
+            and obstacle_distance < self.obstacle_log_warn_distance_m
+        ):
+            self.get_logger().warn(log_msg)
+        else:
+            self.get_logger().info(log_msg)
 
-            if value < min_range:
-                min_range = value
+        self.last_telemetry_log_sec = now_sec
 
-        return min_range
+    def reset_cycle_state(self) -> None:
+        self.action_status_undock = None
+        self.action_status_dock = None
+        self.undock_goal_sent = False
+        self.dock_goal_sent = False
+        self.undock_retries = 0
+        self.dock_retries = 0
 
     def send_goal_undock(self) -> None:
         goal_msg = Undock.Goal()
@@ -299,12 +394,20 @@ class Tb4Patrol(Node):
             self.action_status_undock = GoalStatus.STATUS_ABORTED
             return
 
-        get_result_future = goal_handle.get_result_async()
-        get_result_future.add_done_callback(self.undock_result_callback)
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.undock_result_callback)
 
     def undock_result_callback(self, future: Future) -> None:
         result = future.result()
-        self.action_status_undock = result.status
+        status = result.status
+        is_docked = bool(getattr(result.result, "is_docked", False))
+
+        if status == GoalStatus.STATUS_SUCCEEDED and is_docked:
+            self.action_status_undock = GoalStatus.STATUS_ABORTED
+            self.get_logger().warn("Undock action ended but robot is still docked")
+            return
+
+        self.action_status_undock = status
 
     def send_goal_dock(self) -> None:
         goal_msg = Dock.Goal()
@@ -319,16 +422,20 @@ class Tb4Patrol(Node):
             self.action_status_dock = GoalStatus.STATUS_ABORTED
             return
 
-        get_result_future = goal_handle.get_result_async()
-        get_result_future.add_done_callback(self.dock_result_callback)
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.dock_result_callback)
 
     def dock_result_callback(self, future: Future) -> None:
         result = future.result()
-        self.action_status_dock = result.status
+        status = result.status
+        is_docked = bool(getattr(result.result, "is_docked", False))
 
-    def stop_robot(self) -> None:
-        cmd_msg = Twist()
-        self.publisher_cmd_vel.publish(cmd_msg)
+        if status == GoalStatus.STATUS_SUCCEEDED and not is_docked:
+            self.action_status_dock = GoalStatus.STATUS_ABORTED
+            self.get_logger().warn("Dock action reported success but robot is not docked")
+            return
+
+        self.action_status_dock = status
 
     def __enter__(self) -> Self:
         return self

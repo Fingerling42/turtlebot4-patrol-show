@@ -3,7 +3,7 @@
 <package format="3">
   <name>turtlebot4-patrol-show</name>
   <version>0.0.0</version>
-  <description>TurtleBot4 Pro demo package: undock, lidar patrol, dock.</description>
+  <description>TurtleBot4 Pro demo package: undock, circle patrol, dock.</description>
   <maintainer email="bermanivan42@gmail.com">ivan</maintainer>
   <license>Apache-2.0</license>
 
@@ -12,6 +12,7 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
   <exec_depend>action_msgs</exec_depend>
   <exec_depend>irobot_create_msgs</exec_depend>
   <exec_depend>launch</exec_depend>
