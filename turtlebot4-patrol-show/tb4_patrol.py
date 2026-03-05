@@ -22,6 +22,7 @@ class DemoPhase(Enum):
     DRIVE_FORWARD = auto()
     ROTATE_FOR_CIRCLE = auto()
     CIRCLE = auto()
+    POST_CIRCLE_FORWARD = auto()
     ROTATE_TO_DOCK = auto()
     DRIVE_BACK = auto()
     DOCK = auto()
@@ -46,6 +47,7 @@ class Tb4Patrol(Node):
                 ("forward_speed_mps", 0.10),
                 ("rotate_before_circle_deg", 90.0),
                 ("rotate_speed_radps", 0.6),
+                ("post_circle_forward_distance_m", 0.10),
                 ("circle_diameter_m", 1.0),
                 ("circle_linear_speed_mps", 0.12),
                 ("max_action_retries", 3),
@@ -64,6 +66,9 @@ class Tb4Patrol(Node):
         )
         self.rotate_speed_radps = float(
             self.get_parameter("rotate_speed_radps").value
+        )
+        self.post_circle_forward_distance_m = float(
+            self.get_parameter("post_circle_forward_distance_m").value
         )
         self.circle_diameter_m = float(self.get_parameter("circle_diameter_m").value)
         self.circle_linear_speed_mps = float(
@@ -91,6 +96,9 @@ class Tb4Patrol(Node):
         self.rotate_before_circle_rad = math.radians(self.rotate_before_circle_deg)
         self.rotate_duration_sec = (
             abs(self.rotate_before_circle_rad) / self.rotate_speed_radps
+        )
+        self.post_circle_forward_duration_sec = (
+            self.post_circle_forward_distance_m / self.forward_speed_mps
         )
         self.rotate_direction = (
             1.0 if self.rotate_before_circle_rad >= 0.0 else -1.0
@@ -185,6 +193,7 @@ class Tb4Patrol(Node):
             (
                 "tb4_patrol started: forward=%.2fm @ %.2fm/s, "
                 "rotate=%.1fdeg @ %.2frad/s, "
+                "post_circle_forward=%.2fm, "
                 "return_rotate=%.1fdeg, "
                 "circle_diam=%.2fm @ %.2fm/s, cycle_period=%.0fs"
             )
@@ -193,6 +202,7 @@ class Tb4Patrol(Node):
                 self.forward_speed_mps,
                 self.rotate_before_circle_deg,
                 self.rotate_speed_radps,
+                self.post_circle_forward_distance_m,
                 self.rotate_to_dock_deg,
                 self.circle_diameter_m,
                 self.circle_linear_speed_mps,
@@ -246,8 +256,19 @@ class Tb4Patrol(Node):
             if self.elapsed_phase_sec() >= self.circle_duration_sec:
                 self.stop_robot()
                 self.transition_to(
+                    DemoPhase.POST_CIRCLE_FORWARD,
+                    "Circle done, moving a bit forward before docking turn",
+                )
+            return
+
+        if self.phase == DemoPhase.POST_CIRCLE_FORWARD:
+            self.publish_forward()
+            self.log_telemetry(now)
+            if self.elapsed_phase_sec() >= self.post_circle_forward_duration_sec:
+                self.stop_robot()
+                self.transition_to(
                     DemoPhase.ROTATE_TO_DOCK,
-                    "Circle done, rotating back toward dock",
+                    "Post-circle move done, rotating back toward dock",
                 )
             return
 
@@ -378,7 +399,13 @@ class Tb4Patrol(Node):
         return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
 
     def stop_robot(self) -> None:
-        self.publisher_cmd_vel.publish(Twist())
+        if not rclpy.ok():
+            return
+        try:
+            self.publisher_cmd_vel.publish(Twist())
+        except Exception:
+            # Context may already be shutting down (Ctrl+C via launch).
+            return
 
     def scan_callback(self, msg: LaserScan) -> None:
         nearest = math.inf
@@ -527,12 +554,14 @@ def main(args=None) -> None:
             executor.add_node(tb4_patrol)
             executor.spin()
         except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
-            tb4_patrol.get_logger().warn("Killing tb4_patrol node...")
+            if rclpy.ok():
+                tb4_patrol.get_logger().warn("Killing tb4_patrol node...")
         finally:
             tb4_patrol.stop_robot()
             executor.remove_node(tb4_patrol)
             executor.shutdown()
-            rclpy.shutdown()
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == "__main__":
